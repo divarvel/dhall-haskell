@@ -137,6 +137,7 @@ import Control.Monad.IO.Class (MonadIO(..))
 import Control.Monad.Trans.State.Strict (StateT)
 import Crypto.Hash (SHA256)
 import Data.CaseInsensitive (CI)
+import Data.Either.Validation -- todo
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.Semigroup (Semigroup(..))
 import Data.Text (Text)
@@ -292,22 +293,6 @@ instance Show MissingEnvironmentVariable where
         <>  "\n"
         <>  "↳ " <> Text.unpack name
 
--- | List of Exceptions we encounter while resolving Import Alternatives
-newtype MissingImports = MissingImports [SomeException]
-
-instance Exception MissingImports
-
-instance Show MissingImports where
-    show (MissingImports []) =
-            "\n"
-        <>  "\ESC[1;31mError\ESC[0m: No valid imports"
-    show (MissingImports [e]) = show e
-    show (MissingImports es) =
-            "\n"
-        <>  "\ESC[1;31mError\ESC[0m: Failed to resolve imports. Error list:"
-        <>  "\n"
-        <>  concatMap (\e -> "\n" <> show e <> "\n") es
-
 throwMissingImport :: (MonadCatch m, Exception e) => e -> m a
 throwMissingImport e = throwM (MissingImports [toException e])
 
@@ -458,7 +443,7 @@ localToPath prefix file_ = liftIO $ do
     return (foldr cons prefixPath cs)
 
 -- | Parse an expression from a `Import` containing a Dhall program
-exprFromImport :: Import -> StateT (Status IO) IO Resolved
+exprFromImport :: Import -> ImportResult IO Resolved
 exprFromImport here@(Import {..}) = do
     let ImportHashed {..} = importHashed
 
@@ -487,7 +472,7 @@ exprFromImport here@(Import {..}) = do
         Just resolvedExpression -> do
             let newImport = here
 
-            return (Resolved {..})
+            return (pure $ Resolved {..})
         Nothing -> do
             exprFromUncachedImport here
 
@@ -599,11 +584,11 @@ getCacheDirectory = alternative₀ <|> alternative₁
             Just homeDirectory -> return (homeDirectory </> ".cache")
             Nothing            -> empty
 
-exprFromUncachedImport :: Import -> StateT (Status IO) IO Resolved
+exprFromUncachedImport :: Import -> ImportResult IO Resolved
 exprFromUncachedImport import_@(Import {..}) = do
     let ImportHashed {..} = importHashed
 
-    (path, text, newImport) <- case importType of
+    result <- case importType of
         Local prefix file -> liftIO $ do
             path   <- localToPath prefix file
             exists <- Directory.doesFileExist path
@@ -614,12 +599,12 @@ exprFromUncachedImport import_@(Import {..}) = do
 
             text <- Data.Text.IO.readFile path
 
-            return (path, text, import_)
+            return $ pure (path, text, import_)
 
         Remote url@URL { headers = maybeHeadersExpression } -> do
             maybeHeadersAndExpression <- case maybeHeadersExpression of
                 Nothing -> do
-                    return Nothing
+                    return . pure $ Nothing
                 Just headersExpression -> do
                     expr <- loadWith headersExpression
 
@@ -633,43 +618,49 @@ exprFromUncachedImport import_@(Import {..}) = do
                                 )
                     let suffix_ = Dhall.Pretty.Internal.prettyToStrictText expected
                     let annot = case expr of
-                            Note (Src begin end bytes) _ ->
-                                Note (Src begin end bytes') (Annot expr expected)
+                            Success expr'@(Note (Src begin end bytes) _) ->
+                                pure $ Note (Src begin end bytes') (Annot expr' expected)
                               where
                                 bytes' = bytes <> " : " <> suffix_
-                            _ ->
-                                Annot expr expected
+                            Success expr' ->
+                                pure $ Annot expr' expected
+                            Failure es -> Failure es
 
-                    case Dhall.TypeCheck.typeOf annot of
-                        Left err -> liftIO (throwIO err)
-                        Right _  -> return ()
+                    case Dhall.TypeCheck.typeOf <$> annot of
+                        Success (Left err) -> return . Failure . pure . toException $ err
+                        Success (Right _)  -> return . pure $ ()
+                        Failure es -> return $ Failure es
 
-                    let expr' = Dhall.Core.normalize expr
+                    let expr' = Dhall.Core.normalize <$> expr
 
-                    case toHeaders expr' of
-                        Just headers -> do
-                            return (Just (headers, expr'))
-                        Nothing      -> do
-                            liftIO (throwIO InternalError)
+                    let toHeaders' (Success expr'') = case toHeaders expr'' of
+                          Just headers ->
+                              (Success $ Just (headers, expr''))
+                          Nothing      ->
+                              Failure . pure . toException $ InternalError
+                        toHeaders' (Failure es) = Failure es
+                    return $ toHeaders' expr'
 
 #ifdef MIN_VERSION_http_client
-            let maybeHeaders = fmap fst maybeHeadersAndExpression
+            case maybeHeadersAndExpression of
+                Success mhae -> do
+                  let maybeHeaders = fmap fst mhae
+                  let newHeaders =
+                          fmap (fmap absurd . snd) mhae
 
-            let newHeaders =
-                    fmap (fmap absurd . snd) maybeHeadersAndExpression
+                  (path, text) <- fetchFromHttpUrl url maybeHeaders
 
-            (path, text) <- fetchFromHttpUrl url maybeHeaders
+                  let newImport = Import
+                          { importHashed = ImportHashed
+                              { importType =
+                                  Remote (url { headers = newHeaders })
+                              , ..
+                              }
+                          , ..
+                          }
 
-            let newImport = Import
-                    { importHashed = ImportHashed
-                        { importType =
-                            Remote (url { headers = newHeaders })
-                        , ..
-                        }
-                    , ..
-                    }
-
-            return (path, text, newImport)
+                  return $ Success (path, text, newImport)
+                Failure es -> return $ Failure es
 #else
             let urlString = Text.unpack (Dhall.Core.pretty url)
 
@@ -680,31 +671,34 @@ exprFromUncachedImport import_@(Import {..}) = do
             x <- System.Environment.lookupEnv (Text.unpack env)
             case x of
                 Just string -> do
-                    return (Text.unpack env, Text.pack string, import_)
+                    return $ Success (Text.unpack env, Text.pack string, import_)
                 Nothing -> do
                     throwMissingImport (MissingEnvironmentVariable env)
 
         Missing -> liftIO $ do
             throwM (MissingImports [])
 
-    case importMode of
-        Code -> do
-            let parser = unParser $ do
-                    Text.Parser.Token.whiteSpace
-                    r <- Dhall.Parser.expr
-                    Text.Parser.Combinators.eof
-                    return r
+    case result of
+        Success (path, text, newImport) ->
+            case importMode of
+                Code -> do
+                    let parser = unParser $ do
+                            Text.Parser.Token.whiteSpace
+                            r <- Dhall.Parser.expr
+                            Text.Parser.Combinators.eof
+                            return r
 
-            case Text.Megaparsec.parse parser path text of
-                Left errInfo -> do
-                    liftIO (throwIO (ParseError errInfo text))
-                Right resolvedExpression -> do
-                    return (Resolved {..})
+                    case Text.Megaparsec.parse parser path text of
+                        Left errInfo -> do
+                            liftIO (throwIO (ParseError errInfo text))
+                        Right resolvedExpression -> do
+                            return (pure $ Resolved {..})
 
-        RawText -> do
-            let resolvedExpression = TextLit (Chunks [] text)
+                RawText -> do
+                    let resolvedExpression = TextLit (Chunks [] text)
 
-            return (Resolved {..})
+                    return (pure $ Resolved {..})
+        Failure es -> return $ Failure es
 
 -- | Default starting `Status`, importing relative to the given directory.
 emptyStatus :: FilePath -> Status IO
@@ -715,7 +709,7 @@ emptyStatus = emptyStatusWith exprFromImport exprToImport
     You can configure the desired behavior through the initial `Status` that you
     supply
 -}
-loadWith :: MonadCatch m => Expr Src Import -> StateT (Status m) m (Expr Src X)
+loadWith :: Expr Src Import -> ImportResult m (Expr Src X)
 loadWith expr₀ = case expr₀ of
   Embed import₀ -> do
     Status {..} <- State.get
@@ -763,11 +757,10 @@ loadWith expr₀ = case expr₀ of
                     -- TODO: restructure the Exception hierarchy to prevent
                     -- this nesting from happening in the first place.
                     let handler₀
-                            :: (MonadCatch m)
-                            => MissingImports
-                            -> StateT (Status m) m Resolved
+                            :: MissingImports
+                            -> ImportResult IO Resolved
                         handler₀ (MissingImports es) =
-                          throwM
+                          pure . Failure . pure . toException $
                             (MissingImports
                                (map
                                  (\e -> toException (Imported _stack' e))
@@ -776,79 +769,87 @@ loadWith expr₀ = case expr₀ of
                              )
 
                         handler₁
-                            :: (MonadCatch m)
-                            => SomeException
-                            -> StateT (Status m) m Resolved
+                            :: SomeException
+                            -> ImportResult IO Resolved
                         handler₁ e =
-                          throwMissingImport (Imported _stack' e)
+                          throwMissingImport' (Imported _stack' e)
 
                     -- This loads a \"dynamic\" expression (i.e. an expression
                     -- that might still contain imports)
                     let loadDynamic = _resolver child
 
-                    Resolved {..} <- loadDynamic `catches` [ Handler handler₀, Handler handler₁ ]
+                    loaded <- loadDynamic `catches` [ Handler handler₀, Handler handler₁ ]
 
-                    let stackWithNewImport = NonEmpty.cons newImport _stack
+                    case loaded of
+                      (Success (Resolved {..})) -> do
+                        let stackWithNewImport = NonEmpty.cons newImport _stack
 
-                    let childNodeId = userNodeId _nextNodeId
+                        let childNodeId = userNodeId _nextNodeId
 
-                    -- Increment the next node id
-                    zoom nextNodeId $ State.modify succ
+                        -- Increment the next node id
+                        zoom nextNodeId $ State.modify succ
 
-                    -- Make current node the dot graph
-                    zoom dot . State.put $ importNode childNodeId child
+                        -- Make current node the dot graph
+                        zoom dot . State.put $ importNode childNodeId child
 
-                    zoom stack (State.put stackWithNewImport)
-                    expr'' <- loadWith resolvedExpression
-                    zoom stack (State.put _stack)
+                        zoom stack (State.put stackWithNewImport)
+                        expr'' <- loadWith resolvedExpression
+                        zoom stack (State.put _stack)
 
-                    zoom dot . State.modify $ \getSubDot -> do
-                        parentNode <- _dot
+                        zoom dot . State.modify $ \getSubDot -> do
+                            parentNode <- _dot
 
-                        -- Get current node back from sub-graph
-                        childNode <- getSubDot
+                            -- Get current node back from sub-graph
+                            childNode <- getSubDot
 
-                        -- Add edge between parent and child
-                        parentNode .->. childNode
+                            -- Add edge between parent and child
+                            parentNode .->. childNode
 
-                        -- Return parent NodeId
-                        pure parentNode
+                            -- Return parent NodeId
+                            pure parentNode
 
-                    _cacher child expr''
+                        case expr'' of
+                            Success sexpr'' -> do
+                                _cacher child sexpr''
 
-                    -- Type-check expressions here for three separate reasons:
-                    --
-                    --  * to verify that they are closed
-                    --  * to catch type errors as early in the import process
-                    --    as possible
-                    --  * to avoid normalizing ill-typed expressions that need
-                    --    to be hashed
-                    --
-                    -- There is no need to check expressions that have been
-                    -- cached, since they have already been checked
-                    expr''' <- case Dhall.TypeCheck.typeWith _startingContext expr'' of
-                        Left  err -> throwM (Imported _stack' err)
-                        Right _   -> return (Dhall.Core.normalizeWith _normalizer expr'')
-                    zoom cache (State.modify' (Map.insert child (childNodeId, expr''')))
-                    return expr'''
+                                -- Type-check expressions here for three separate reasons:
+                                --
+                                --  * to verify that they are closed
+                                --  * to catch type errors as early in the import process
+                                --    as possible
+                                --  * to avoid normalizing ill-typed expressions that need
+                                --    to be hashed
+                                --
+                                -- There is no need to check expressions that have been
+                                -- cached, since they have already been checked
+                                expr''' <- case Dhall.TypeCheck.typeWith _startingContext sexpr'' of
+                                    Left  err -> throwM (Imported _stack' err)
+                                    Right _   -> return (Dhall.Core.normalizeWith _normalizer sexpr'')
+                                zoom cache (State.modify' (Map.insert child (childNodeId, expr''')))
+                                return $ Success expr'''
+                            Failure es -> return $ Failure es
+                      (Failure es) -> return $ Failure es
 
-    case hash (importHashed import₀) of
-        Nothing -> do
-            return ()
-        Just expectedHash -> do
-            let matches version =
-                    let actualHash =
-                            hashExpression version (Dhall.Core.alphaNormalize expr)
+    case expr of
+        Success sexpr ->
+          case hash (importHashed import₀) of
+              Nothing -> do
+                  return $ Success ()
+              Just expectedHash -> do
+                  let matches version =
+                          let actualHash =
+                                  hashExpression version (Dhall.Core.alphaNormalize sexpr)
 
-                    in  expectedHash == actualHash
+                          in  expectedHash == actualHash
 
-            if any matches [ minBound .. maxBound ]
-                then return ()
-                else do
-                    let actualHash =
-                            hashExpression NoVersion (Dhall.Core.alphaNormalize expr)
+                  if any matches [ minBound .. maxBound ]
+                      then return $ Success ()
+                      else do
+                          let actualHash =
+                                  hashExpression NoVersion (Dhall.Core.alphaNormalize sexpr)
 
-                    throwMissingImport (Imported _stack' (HashMismatch {..}))
+                          throwMissingImport' (Imported _stack' (HashMismatch {..}))
+        Failure es -> return $ Failure es
 
     return expr
   ImportAlt a b -> loadWith a `catch` handler₀

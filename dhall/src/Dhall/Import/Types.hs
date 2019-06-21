@@ -4,11 +4,12 @@
 
 module Dhall.Import.Types where
 
-import Control.Exception (Exception)
+import Control.Exception (Exception, SomeException, toException)
 import Control.Monad.Trans.State.Strict (StateT)
 import Data.Dynamic
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map (Map)
+import Data.Either.Validation -- todo
 import Data.Semigroup ((<>))
 import Dhall.Binary (StandardVersion(..))
 import Dhall.Context (Context)
@@ -68,14 +69,35 @@ data Status m = Status
 
     , _startingContext :: Context (Expr Src X)
 
-    , _resolver :: Import -> StateT (Status m) m Resolved
+    , _resolver :: Import -> ImportResult IO Resolved
 
     , _cacher :: Import -> Expr Src X -> StateT (Status m) m ()
     }
 
+-- | List of Exceptions we encounter while resolving Import Alternatives
+newtype MissingImports = MissingImports [SomeException]
+
+instance Exception MissingImports
+
+instance Show MissingImports where
+    show (MissingImports []) =
+            "\n"
+        <>  "\ESC[1;31mError\ESC[0m: No valid imports"
+    show (MissingImports [e]) = show e
+    show (MissingImports es) =
+            "\n"
+        <>  "\ESC[1;31mError\ESC[0m: Failed to resolve imports. Error list:"
+        <>  "\n"
+        <>  concatMap (\e -> "\n" <> show e <> "\n") es
+
+type ImportResult m a = StateT (Status m) m (Validation (NonEmpty SomeException) a)
+throwMissingImport' ::Exception e => e -> ImportResult IO Resolved
+throwMissingImport' = pure . Failure . pure . toException . MissingImports . pure . toException
+
+
 -- | Default starting `Status` that is polymorphic in the base `Monad`
 emptyStatusWith
-    :: (Import -> StateT (Status m) m Resolved)
+    :: (Import -> ImportResult IO Resolved)
     -> (Import -> Expr Src X -> StateT (Status m) m ())
     -> FilePath
     -> Status m
@@ -152,7 +174,7 @@ startingContext k s =
 
 resolver
     :: Functor f
-    => LensLike' f (Status m) (Import -> StateT (Status m) m Resolved)
+    => LensLike' f (Status m) (Import -> ImportResult IO Resolved)
 resolver k s = fmap (\x -> s { _resolver = x }) (k (_resolver s))
 
 cacher
